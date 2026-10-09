@@ -14,3 +14,9 @@ the data
     - yeah ok want pKd. also helps with thermodynamics eqns later on
 - looking through the protein ligand binding index, there are 6835 with just Kd, 4901 with just Ki, and 107 with both. Looks like a common approach is to combine the two, but they do represent different things and comparing them, they are often different (sometimes even different orders of magnitude). Kd is without competition in the system, Ki is with competition. To start with, I'll look just at Kd (pKd) and go on from there. There are ~7K Kd, which, depending on the differet types of protein structures (i.e. similarities), may be just about enough. but i will find out as i go on.
 - there are also some cases where there is a description text that contains Kd rather than the raw value, so for the simplest model will cutoff anything with len > 12 - this removed 7.
+- i now have a very fragile index processing pipeline. now onto the actual protein and ligand files themselves. they're split into time ranges, and cross referenceing what's in them with the Kd index ones i have chosen: 1981-2000 (382 folders), 2001-2010 (1745), and 2011-2019 (4806). so, 6933 total. It would be nice to have split on maybe the first 2 sets of years, but should use more than that for the training split. first i will load in all the ligands/etc to see how many fail to get final counts
+- before running the whole thing, going to split this preprocessing pipeline into separate modules. im thinking: index parsing, ligand parsing, protein pocket parsing, and physics features (more to be added later). 
+- in the first year group, only fails one, where rdkit can't parse, that's fine.
+- remove all Hs so consistent across all molecs
+- make a separate label for metals
+
