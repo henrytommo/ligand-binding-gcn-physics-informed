@@ -4,20 +4,18 @@ import numpy as np
 import torch
 from torch_geometric.data import Data
 
-import features
-from config import (
+from de import features
+from de.config import (
+    COINCIDENT_DISTANCE,
     DISTANCE_CUTOFF,
     NODE_COFACTOR,
     NODE_LIGAND,
     NODE_METAL,
     NODE_PROTEIN,
+    RESIDUE_OTHER,
 )
 
-# edge classes. the three a binding energy term acts on are the ligand's
-# contacts outwards: LIG_PROT (~4% of a radius graph), LIG_METAL (coordination,
-# with its own functional form) and LIG_COFACTOR. HETERO is everything else
-# touching a metal or cofactor - protein to metal, metal to metal and so on -
-# which is the pocket's environment rather than the binding itself
+# edge classes
 EDGE_LIG_COVALENT = 0
 EDGE_LIG_LIG = 1
 EDGE_PROT_PROT = 2
@@ -25,46 +23,65 @@ EDGE_LIG_PROT = 3
 EDGE_LIG_METAL = 4
 EDGE_LIG_COFACTOR = 5
 EDGE_HETERO = 6
+N_EDGE_TYPES = EDGE_HETERO + 1
+
+# what a binding energy may sum over, i.e. not ligand-ligand etc
+INTERFACE_EDGES = (EDGE_LIG_PROT, EDGE_LIG_METAL, EDGE_LIG_COFACTOR)
 
 
-def build_graph(ligand, pocket, label, node_feature_names=None):
+def _pocket_duplicates(ligand_coords, pocket_coords):
     """
-    One complex -> one Data, with no edges.
+    Mask over POCKET atoms, true where one duplicates an earlier atom.
+    """
+    coords = torch.from_numpy(np.concatenate([ligand_coords, pocket_coords]))
+    close = (torch.cdist(coords, coords) < COINCIDENT_DISTANCE).numpy()
+    # column j is a duplicate only if some earlier i < j sits on it, so
+    # np.triu keeps the first of each group
+    duplicate = np.triu(close, k=1).any(axis=0)
+    return duplicate[len(ligand_coords):]
 
-    Edges are left out deliberately: a radius graph is ~14k directed edges per
-    complex, ~3 GB over the set against ~170 MB for the point clouds alone.
-    add_edges() builds them at load time, so the cutoff can change without a
-    reparse.
 
-    Ligand nodes come first, so the ligand's bond indices carry over unchanged.
+def build_graph(ligand, pocket, label, node_feature_names=None, pdb_code=None):
+    """
+    One complex -> one Data, no edges.
+    Ligand nodes come first and are never dropped, so bond indices carry over
     """
     if node_feature_names is None:
         node_feature_names = features.DEFAULT_NODE_FEATURES
 
     n_ligand = len(ligand["coords"])
-    n_pocket = len(pocket["coords"])
-    if len(ligand["atomic_nums"]) != n_ligand:
-        raise ValueError(
-            f"ligand arrays disagree: {n_ligand} coords, "
-            f"{len(ligand['atomic_nums'])} elements"
-        )
-    if not n_pocket == len(pocket["atomic_nums"]) == len(pocket["node_types"]):
-        raise ValueError(
-            f"pocket arrays disagree: {n_pocket} coords, "
-            f"{len(pocket['atomic_nums'])} elements, "
-            f"{len(pocket['node_types'])} node types"
-        )
-
-    coords = np.concatenate([ligand["coords"], pocket["coords"]]).astype(np.float32)
-    atomic_nums = np.concatenate([ligand["atomic_nums"], pocket["atomic_nums"]])
-    node_type = np.concatenate(
-        [np.full(n_ligand, NODE_LIGAND, dtype=np.int8), pocket["node_types"]]
+    # both parsers derive every array from one source, so a disagreement is a
+    # parser bug, not bad input. build.py catches it either way
+    assert len(ligand["atomic_nums"]) == n_ligand
+    assert (
+        len(pocket["coords"])
+        == len(pocket["atomic_nums"])
+        == len(pocket["node_types"])
+        == len(pocket["residue_types"])
     )
 
+    keep = ~_pocket_duplicates(ligand["coords"], pocket["coords"])
+    coords = np.concatenate(
+        [ligand["coords"], pocket["coords"][keep]]
+    ).astype(np.float32)
+    atomic_nums = np.concatenate(
+        [ligand["atomic_nums"], pocket["atomic_nums"][keep]]
+    )
+    node_type = np.concatenate(
+        [np.full(n_ligand, NODE_LIGAND, dtype=np.int8), pocket["node_types"][keep]]
+    )
+    # the ligand belongs to no amino acid, so it takes the catch-all class
+    residue_type = np.concatenate(
+        [np.full(n_ligand, RESIDUE_OTHER, dtype=np.int8), pocket["residue_types"][keep]]
+    )
+
+    # only atomic_nums is read today; the rest is the surface features.py's
+    # declared stubs will need
     ctx = {
         "atomic_nums": atomic_nums,
         "coords": coords,
         "node_type": node_type,
+        "residue_type": residue_type,
         "ligand": ligand,
         "pocket": pocket,
         "n_ligand": n_ligand,
@@ -76,24 +93,28 @@ def build_graph(ligand, pocket, label, node_feature_names=None):
         pos=torch.from_numpy(coords),
         atomic_num=torch.from_numpy(atomic_nums.astype(np.int64)),
         node_type=torch.from_numpy(node_type.astype(np.int64)),
+        residue_type=torch.from_numpy(residue_type.astype(np.int64)),
         y=torch.tensor([label], dtype=torch.float32),
         # *_index so pyg offsets it correctly if a batch is built before add_edges
         lig_bond_index=torch.from_numpy(ligand["bonds"]),
         n_ligand=n_ligand,
+        pdb_code=pdb_code,
     )
 
 
 def _classify_edges(edge_index, node_type, lig_bond_index):
     """
     An edge class per edge, from the node classes at each end plus the ligand's
-    real bonds. Assigned in order, so later ones win: HETERO goes down first and
-    is overridden wherever a ligand is one end, with covalent last of all.
+    real bonds. Later assignments win: HETERO goes down first and is overridden
+    wherever a ligand is one end, covalent last of all.
     """
     src, dst = edge_index
-    lig_src, lig_dst = node_type[src] == NODE_LIGAND, node_type[dst] == NODE_LIGAND
-    prot_src, prot_dst = node_type[src] == NODE_PROTEIN, node_type[dst] == NODE_PROTEIN
-    cof_src, cof_dst = node_type[src] == NODE_COFACTOR, node_type[dst] == NODE_COFACTOR
-    met_src, met_dst = node_type[src] == NODE_METAL, node_type[dst] == NODE_METAL
+    # gather the endpoint classes once, not once per comparison
+    type_src, type_dst = node_type[src], node_type[dst]
+    lig_src, lig_dst = type_src == NODE_LIGAND, type_dst == NODE_LIGAND
+    prot_src, prot_dst = type_src == NODE_PROTEIN, type_dst == NODE_PROTEIN
+    cof_src, cof_dst = type_src == NODE_COFACTOR, type_dst == NODE_COFACTOR
+    met_src, met_dst = type_src == NODE_METAL, type_dst == NODE_METAL
 
     edge_type = torch.full_like(src, EDGE_PROT_PROT)
     edge_type[cof_src | cof_dst | met_src | met_dst] = EDGE_HETERO
@@ -125,18 +146,17 @@ def add_edges(data, distance_cutoff=DISTANCE_CUTOFF, edge_feature_names=None):
         edge_feature_names = features.DEFAULT_EDGE_FEATURES
 
     distance_matrix = torch.cdist(data.pos, data.pos)
-    edge_index = (distance_matrix < distance_cutoff).nonzero(as_tuple=False).t()
-    # mask out self-loops rather than subtract an identity matrix, which would
-    # be a second N x N allocation
-    edge_index = edge_index[:, edge_index[0] != edge_index[1]].contiguous()
+    within = distance_matrix < distance_cutoff
+    # clear the diagonal in place rather than filtering an edge list afterwards,
+    # which would copy the whole list to drop the self-loops
+    within.fill_diagonal_(False)
+    edge_index = torch.stack(within.nonzero(as_tuple=True))
 
     distances = distance_matrix[edge_index[0], edge_index[1]]
     edge_type = _classify_edges(edge_index, data.node_type, data.lig_bond_index)
 
     edge_attr = features.build_features(
-        features.EDGE_FEATURES,
-        edge_feature_names,
-        {"distances": distances.numpy(), "edge_type": edge_type.numpy()},
+        features.EDGE_FEATURES, edge_feature_names, {"distances": distances.numpy()}
     )
 
     data.edge_index = edge_index

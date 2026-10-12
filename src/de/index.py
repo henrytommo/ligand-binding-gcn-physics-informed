@@ -3,11 +3,9 @@
 import math
 import re
 
-from config import INDEX_FILE_PL
+from de.config import INDEX_FILE_PL
 
-# a usable label is an exact measurement alone in the binding field, e.g.
-# Kd=49uM. rejects free text (the index sometimes puts a Kd in the comment) and
-# censored bounds (Kd<10uM)
+# use only bare kd=xnm measurements, not descriptions
 BINDING_TOKEN_RE = re.compile(
     r"^(?P<kind>Kd|Ki|IC50)=(?P<val>\d+\.?\d*)(?P<unit>[munpf]M)$"
 )
@@ -24,12 +22,7 @@ UNIT_TO_MOLAR = {
 def load_index(index_file=INDEX_FILE_PL):
     """
     Read an index .lst into (pdb_code, resolution, year, binding, comment) rows.
-
-    Fields are positional with the comment last, so maxsplit=4 is the whole
-    parse - the comment may contain anything, including its own "Kd=..." text.
-
-    Raises on a non-blank line with too few fields rather than skipping it: a
-    silently dropped row is a silently dropped label.
+    raise error on non blank line with too few fields
     """
     rows = []
     with open(index_file) as f:
@@ -42,22 +35,23 @@ def load_index(index_file=INDEX_FILE_PL):
                     f"{index_file}:{lineno} has {len(parts)} fields, expected 4 or 5"
                 )
             if len(parts) == 4:
-                parts.append("")
+                parts.append("") #for lines without comment
             rows.append(tuple(p.strip() for p in parts))
     return rows
 
 
 def parse_binding_token(token, kind="Kd"):
     """
-    'Kd=49uM' -> 4.31, i.e. pKd = -log10(Kd in molar), positive for sub-molar.
-    None unless the token is an exact measurement of `kind`, so censored bounds
-    and free text are both rejected.
+    'Kd=49uM' -> 4.31, i.e. pKd = -log10(Kd in molar)
+    convert to M as some are nm, um etc
     """
+    if kind not in ("Kd", "Ki", "IC50"):
+        raise ValueError(f"unknown measurement kind {kind}")
     match = BINDING_TOKEN_RE.match(token)
     if match is None or match.group("kind") != kind:
         return None
     molar = float(match.group("val")) * UNIT_TO_MOLAR[match.group("unit")]
-    if molar <= 0:
+    if molar <= 0: # so we don't get inf when taking log
         return None
     return -math.log10(molar)
 

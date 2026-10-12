@@ -6,55 +6,45 @@ from datetime import date
 
 import torch
 
-import features
-from config import CACHE_FILE, INDEX_FILE_PL, PL_DIR, YEAR_RANGES
-from graph import build_graph
-from index import build_labels
-from ligand import parse_ligand, quiet_rdkit_warnings
-from pocket import parse_pocket
+from de import features
+from de.config import CACHE_FILE, INDEX_FILE_PL, PL_DIR, YEAR_RANGES
+from de.graph import build_graph
+from de.index import build_labels
+from de.ligand import parse_ligand, quiet_rdkit_warnings
+from de.pocket import parse_pocket
 
 
-def iter_complexes(labels, year_ranges=YEAR_RANGES, pl_dir=PL_DIR):
+def iter_complex_dirs(wanted, year_ranges=YEAR_RANGES, pl_dir=PL_DIR):
     """
-    Yield (pdb_code, sdf_path, pocket_path) for every labelled complex with a
-    directory on disk. The directory name is the pdb code.
+    Yield (pdb_code, complex_dir) for every wanted complex with a directory on
+    disk. The directory name is the pdb code.
     """
     for year_range in year_ranges:
         year_dir = pl_dir / year_range
         if not year_dir.is_dir():
             continue
         for complex_dir in sorted(year_dir.iterdir()):
-            pdb_code = complex_dir.name
-            if not complex_dir.is_dir() or pdb_code not in labels:
-                continue
-            yield (
-                pdb_code,
-                complex_dir / f"{pdb_code}_ligand.sdf",
-                complex_dir / f"{pdb_code}_pocket.pdb",
-            )
+            if complex_dir.is_dir() and complex_dir.name in wanted:
+                yield complex_dir.name, complex_dir
 
 
-def build_dataset(
-    kind="Kd",
-    year_ranges=YEAR_RANGES,
-    node_feature_names=None,
-    index_file=INDEX_FILE_PL,
-    labels=None,
-):
+def iter_complexes(labels, year_ranges=YEAR_RANGES, pl_dir=PL_DIR):
+    """Yield (pdb_code, sdf_path, pocket_path) for every labelled complex."""
+    for pdb_code, complex_dir in iter_complex_dirs(labels, year_ranges, pl_dir):
+        yield (
+            pdb_code,
+            complex_dir / f"{pdb_code}_ligand.sdf",
+            complex_dir / f"{pdb_code}_pocket.pdb",
+        )
+
+
+def build_dataset(labels, year_ranges=YEAR_RANGES, node_feature_names=None):
     """
     Returns (graphs, failures).
-
-    Each complex is attempted independently, so one unreadable file costs that
-    complex alone. failures holds (pdb_code, stage, reason), so the drop-out can
-    be counted by cause rather than guessed at.
-
-    Pass `labels` to reuse a label table already built, instead of parsing the
-    index a second time.
+    Each complex attempted independently, so won;t fail whole pipeline
     """
     if node_feature_names is None:
         node_feature_names = features.DEFAULT_NODE_FEATURES
-    if labels is None:
-        labels = build_labels(index_file, kind)
 
     graphs, failures = [], []
 
@@ -74,7 +64,13 @@ def build_dataset(
 
             stage = "graph"
             graphs.append(
-                build_graph(ligand, pocket, labels[pdb_code], node_feature_names)
+                build_graph(
+                    ligand,
+                    pocket,
+                    labels[pdb_code],
+                    node_feature_names,
+                    pdb_code=pdb_code,
+                )
             )
         except Exception as exc:
             failures.append((pdb_code, stage, f"{type(exc).__name__}: {exc}"))
@@ -82,15 +78,12 @@ def build_dataset(
     return graphs, failures
 
 
-def save_dataset(graphs, failures, config, path=CACHE_FILE):
+def save_dataset(blob, path=CACHE_FILE):
     """
-    Graphs, failures and the config they were built with, in one file - no
-    second format to keep in step, and a cache can be checked against the ask.
+    Graphs, failures and the config they were built with, in one file
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {"graphs": graphs, "failures": failures, "config": config}, path
-    )
+    torch.save(blob, path)
     return path
 
 
@@ -100,27 +93,31 @@ def load_dataset(path=CACHE_FILE):
 
 
 def main():
+    """Parse, build, save. Returns the saved blob, so a notebook caller does not
+    have to read 160 MB back off disk."""
     quiet_rdkit_warnings()
     started = time.perf_counter()
     kind = "Kd"
     node_feature_names = features.DEFAULT_NODE_FEATURES
 
     labels = build_labels(INDEX_FILE_PL, kind)
-    graphs, failures = build_dataset(
-        kind=kind, node_feature_names=node_feature_names, labels=labels
-    )
+    graphs, failures = build_dataset(labels, node_feature_names=node_feature_names)
     elapsed = time.perf_counter() - started
 
-    config = {
-        "kind": kind,
-        "year_ranges": list(YEAR_RANGES),
-        "index_file": str(INDEX_FILE_PL),
-        "node_features": list(node_feature_names),
-        "num_node_features": int(graphs[0].x.shape[1]) if graphs else 0,
-        "n_graphs": len(graphs),
-        "built": date.today().isoformat(),
+    blob = {
+        "graphs": graphs,
+        "failures": failures,
+        "config": {
+            "kind": kind,
+            "year_ranges": list(YEAR_RANGES),
+            "index_file": str(INDEX_FILE_PL),
+            "node_features": list(node_feature_names),
+            "num_node_features": int(graphs[0].x.shape[1]) if graphs else 0,
+            "n_graphs": len(graphs),
+            "built": date.today().isoformat(),
+        },
     }
-    path = save_dataset(graphs, failures, config)
+    path = save_dataset(blob)
 
     n_attempted = len(graphs) + len(failures)
     print(f"{kind + ' labels in index:':<23}{len(labels)}")
@@ -142,7 +139,8 @@ def main():
         print(f"{'pKd range:':<23}{pkd.min():.2f} .. {pkd.max():.2f}")
         print(f"{'pKd mean:':<23}{pkd.mean():.2f}")
 
-    print(f"\nwrote {path} in {elapsed:.1f}s")
+    print(f"\nprocessed in {elapsed:.1f}s, wrote {path}")
+    return blob
 
 
 if __name__ == "__main__":
