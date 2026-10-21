@@ -53,15 +53,33 @@ def dims_of(graphs):
     }
 
 
-def evaluate(spec, train, val, test, params=None, seed=0):
+class Result(NamedTuple):
     """
-    Fit on train (val only for early stopping), then score test once.
-    Returns (model, metrics). Target statistics come from train alone, so
-    nothing about val or test reaches the fit.
+    One fit and score. The predictions come back too, so per-complex error can
+    be analysed later without refitting; they are in the order of whichever set
+    `evaluate`'s `score` named.
+    """
+
+    model: object
+    metrics: dict
+    y_true: np.ndarray
+    y_pred: np.ndarray
+
+
+def evaluate(spec, train, val, test, params=None, seed=0, score="val"):
+    """
+    Fit on train, then score one set. Target statistics come from train alone,
+    so nothing about val or test reaches the fit.
+
+    score="val" is the development default and leaves the test holdout
+    untouched; "test" is for the one final reading. val doubles as the
+    early-stopping set, so a val metric is optimistic by however much 20-odd
+    epochs of epoch selection buys - every variant pays the same bias, which is
+    what makes val fair for comparing them and wrong for quoting absolutely.
     """
     params = {**spec.params, **(params or {})}
     target = Target.fit(train)
     model = spec.build(params, dims_of(train), seed, spec.edge_features)
     model = spec.fit(model, train, val, params, target)
-    y_true, y_pred = spec.predict(model, test, target)
-    return model, regression_metrics(y_true, y_pred)
+    y_true, y_pred = spec.predict(model, {"val": val, "test": test}[score], target)
+    return Result(model, regression_metrics(y_true, y_pred), y_true, y_pred)

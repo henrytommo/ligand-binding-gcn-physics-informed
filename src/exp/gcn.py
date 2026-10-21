@@ -11,6 +11,7 @@
 # Lennard-Jones into a log potential.
 
 import copy
+import time
 
 import torch
 import torch.nn.functional as F
@@ -25,7 +26,8 @@ from de.graph import INTERFACE_EDGES, N_EDGE_TYPES
 from exp.spec import ModelSpec
 
 MAX_EPOCHS = 200
-PATIENCE = 20
+# lower patience for memory + time reasons during experiemntation
+PATIENCE = 10
 GRAD_CLIP = 5.0
 
 DEFAULTS = {
@@ -60,18 +62,14 @@ class PhysicsGCN(nn.Module):
 
         self.element = nn.Embedding(N_ELEMENTS, hidden)
         self.node_type = nn.Embedding(N_NODE_TYPES, hidden)
-        # without this an Asp carboxylate oxygen and a Ser hydroxyl are the same
-        # input vector - same element, node class and vdW radius - despite
-        # differing in charge and in whether they can donate a hydrogen bond
+        # helps differentiate same atom in different residue
         self.residue_type = nn.Embedding(N_RESIDUE_TYPES, hidden)
         self.node_proj = nn.Linear(node_feat_dim, hidden)
         self.edge_type = nn.Embedding(N_EDGE_TYPES, hidden)
         self.edge_proj = nn.Linear(edge_feat_dim, hidden)
 
         # LayerNorm plus a residual per conv. GINEConv sums over neighbours and
-        # the 4A graph has mean degree 11, so unnormalised activations grow ~11x
-        # a layer, 1000x across three; at 5A that was degree 22 and the initial
-        # mse on centred pKd came out ~500 instead of ~1
+        # the 4 angstrom graph has mean degree 11, so unnormalised activations grow lik11x per layer
         self.convs = nn.ModuleList(
             GINEConv(_mlp(hidden, hidden, hidden)) for _ in range(n_layers)
         )
@@ -193,6 +191,8 @@ def _fit(model, train, val, params, target):
     Adam with early stopping on val, restoring the best weights.
 
     `target` was fitted on train, so val contributes nothing but when to stop.
+    The per-epoch curve lands on model.history, and best_epoch / best_val_loss
+    beside it: losses in encoded units, so comparable only within a run.
     """
     max_epochs = params.get("max_epochs", MAX_EPOCHS)
     patience = params.get("patience", PATIENCE)
@@ -202,18 +202,39 @@ def _fit(model, train, val, params, target):
         model.parameters(), lr=params["lr"], weight_decay=params["weight_decay"]
     )
 
-    best_loss, best_state, waited = float("inf"), None, 0
-    for _epoch_index in range(max_epochs):
-        _epoch(model, train_loader, target, optimizer)
+    progress = params.get("progress", False)
+    model.history = history = []
+    model.best_epoch, model.best_val_loss = None, float("inf")
+    best_state, waited = None, 0
+    for epoch_index in range(max_epochs):
+        started = time.perf_counter()
+        train_loss = _epoch(model, train_loader, target, optimizer)
+        val_loss = _epoch(model, val_loader, target) if val_loader else float("nan")
+        history.append(
+            {
+                "epoch": epoch_index,
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+                "seconds": round(time.perf_counter() - started, 2),
+            }
+        )
         if val_loader is None:
             continue
-        loss = _epoch(model, val_loader, target)
-        if loss < best_loss:
-            best_loss, best_state, waited = loss, copy.deepcopy(model.state_dict()), 0
+        if val_loss < model.best_val_loss:
+            model.best_epoch, model.best_val_loss = epoch_index, val_loss
+            best_state, waited = copy.deepcopy(model.state_dict()), 0
         else:
             waited += 1
-            if waited >= patience:
-                break
+        if progress:
+            print(
+                f"    epoch {epoch_index:>3}  train {train_loss:.4f}  "
+                f"val {val_loss:.4f}  best {model.best_val_loss:.4f}"
+                f"@{model.best_epoch}  waited {waited}  "
+                f"[{history[-1]['seconds']:.1f}s]",
+                flush=True,
+            )
+        if waited >= patience:
+            break
     if best_state is not None:
         model.load_state_dict(best_state)
     return model

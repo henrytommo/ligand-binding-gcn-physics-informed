@@ -134,9 +134,23 @@ gcn.py
 
 
 ## training
+- realised i need to make holdout set so i can test against this - re ran clusternig and getting a kind of leakage from clusters that are subsets of other clusters. updating split.py before running the tests - keep the original easy search, then search_pairs (all vs all)
+    - this comes from the way the clustering happens: using cascaded clustering, in which there are rounds where sensitivity is increased. after each round, each cluster is collapsed to its representative, to only representatives got to the next round for comparison. so say we have 3 chains, A, B, C, where A-B = 35% similar, B-C = 35% similar, and A-C = 20% similar, if B is picked as representative, then A, B, C are clustered together. But if A is picked, C doesn't amke that cluster. can remove cascade.
+- i think a recurring thing here is due to the way i am doing the split, the test class will always contain the smaller protein families, as test is a smaller split. this means that there will probs be worse scores in test, bc the train set contains larger families that have been trained on. will probs need to do a holdout on the bigger set (in the to do list), but now that we have a pretty good compare set up we can just compare that.
+
 - running into a hardware issue - one epoch takes >40s so kind of slow. can try a shorter max distace (maybe 4 angstroms rather tha 5), so looking over fewer bonds. also maybe add an early stopping - i.e. if no improvement after 15-20 epochs, stop there (similar to qsar)
 - edges are important here so want somehting like a gineconv. will compare this and CGConv and GATv2 when i get to the experiment phase.
 
+- starting off with patience = 10
+- doing a run first to see how long it takes and get a baseline, then will run gcn with physics vs without to see if we even want to add that.
+
+- ok another issue: 
+
+- running against the (admittedly primitive) baselines, this took about 2 hours
+- r2 measures how much better the model is than predicting the actual pkd mean (note, baseline scores can be negative bc they use train mean whereas r2 is test mean)
+    - similar to rmse, just tells in a differwnt way
+
+- the run died - ran out of memory, updating so it saves incrementally so i don't lose everything when it stops
 
 to do
 - run holdout test  Run a large-family holdout as a separate experiment: train on everything except the 532-cluster, test on that cluster alone.

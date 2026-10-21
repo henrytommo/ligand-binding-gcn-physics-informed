@@ -6,6 +6,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DATA_DIR = PROJECT_ROOT / "data"
 INPUT_DIR = DATA_DIR / "input"
 PROCESSED_DIR = DATA_DIR / "processed"
+# one timestamped subdirectory per training run: curves, metrics, predictions,
+# the config that produced them and the best weights
+TRAIN_DIR = DATA_DIR / "train"
 
 INDEX_FILE_PL = INPUT_DIR / "index" / "INDEX_general_PL.2020R1.lst"
 PL_DIR = INPUT_DIR / "P-L"

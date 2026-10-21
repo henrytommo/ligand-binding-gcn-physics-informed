@@ -24,15 +24,22 @@ COVERAGE = 0.8
 COV_MODE = 1
 CLUSTER_MODE = 1
 
+# SINGLE_STEP to avoid leakage we had earlier due to cascaded clsutering
+SENSITIVITY = 7.5
+MAX_SEQS = 2000
+SINGLE_STEP = 1
+
 # mmseqs defaults this to all system memory; the dataset needs a fraction of it
 MEMORY_LIMIT = "4G"
 
 FRACTIONS = {"train": 0.8, "val": 0.1, "test": 0.1}
 SEED = 0
 
-# a cluster bigger than this fraction of the smallest quota is forced into train.
-# measured over 10 runs it gave the most stable sizes (test 697 +- 4, biggest
-# family 55 +- 8); 0.25 traded that for slightly better pKd balance
+# test holdout
+TEST_SEED = 0
+
+# a cluster bigger than this frac is excluded from test eligibility, 
+# and in the development split it goes to train first
 GUARD = 0.10
 
 
@@ -124,6 +131,9 @@ def cluster_sequences(
     coverage=COVERAGE,
     cov_mode=COV_MODE,
     cluster_mode=CLUSTER_MODE,
+    sensitivity=SENSITIVITY,
+    max_seqs=MAX_SEQS,
+    single_step=SINGLE_STEP,
     memory_limit=MEMORY_LIMIT,
 ):
     """
@@ -156,6 +166,9 @@ def cluster_sequences(
                 "-c", str(coverage),
                 "--cov-mode", str(cov_mode),
                 "--cluster-mode", str(cluster_mode),
+                "-s", str(sensitivity),
+                "--max-seqs", str(max_seqs),
+                "--single-step-clustering", str(single_step),
                 "--split-memory-limit", memory_limit,
                 "-v", "1",
             ],
@@ -175,24 +188,73 @@ def cluster_sequences(
     return _merge_groups(sequences, merge.values())
 
 
-def assign_splits(cluster_of, fractions=FRACTIONS, seed=SEED, guard=GUARD):
-    """
-    {pdb_code: split name}, every member of a cluster landing in the same split.
-    Clusters above `guard` x the smallest quota go to train first
-    rest are shuffled and each goes to whichever split is furthest below
-    quota in RELATIVE terms.
-    """
+def _members_of(cluster_of):
+    """{cluster_id: [pdb_code]}, in a deterministic order"""
     members = defaultdict(list)
     for pdb_code, cluster in cluster_of.items():
         members[cluster].append(pdb_code)
+    return members
 
-    quota = {name: frac * len(cluster_of) for name, frac in fractions.items()}
-    threshold = guard * min(quota.values())
 
-    clusters = list(members.values())
+def _guard_threshold(cluster_of, fractions, guard):
+    """a cluster bigger than this is too big to place by quota"""
+    return guard * min(frac * len(cluster_of) for frac in fractions.values())
+
+
+def test_clusters(cluster_of, fractions=FRACTIONS, guard=GUARD, test_seed=TEST_SEED):
+    """
+    The cluster ids reserved for test, from test_seed alone - so no development
+    seed can move them. Clusters above the guard are left to the development
+    pool: one large family would otherwise swamp a 10% holdout.
+    """
+    members = _members_of(cluster_of)
+    quota = fractions["test"] * len(cluster_of)
+    threshold = _guard_threshold(cluster_of, fractions, guard)
+
+    # sorted, not dict order
+    eligible = sorted(c for c, names in members.items() if len(names) <= threshold)
+    random.Random(test_seed).shuffle(eligible)
+
+    reserved, filled = set(), 0
+    for cluster in eligible:
+        if filled >= quota:
+            break
+        reserved.add(cluster)
+        filled += len(members[cluster])
+    return reserved
+
+
+def assign_splits(
+    cluster_of, fractions=FRACTIONS, seed=SEED, guard=GUARD, test_seed=TEST_SEED,
+):
+    """
+    {pdb_code: split name}, every member of a cluster landing in the same split.
+
+    Test is made first and depends on test_seed only, so every development
+    seed sees the same holdout. The remaining clusters are shuffled by `seed`;
+    those above `guard` x the smallest quota go to train first, and the rest go
+    to whichever of train/val is furthest below quota in RELATIVE terms.
+    """
+    members = _members_of(cluster_of)
+    reserved = test_clusters(cluster_of, fractions, guard, test_seed)
+    threshold = _guard_threshold(cluster_of, fractions, guard)
+
+    assignment = {}
+    for cluster in reserved:
+        assignment.update(dict.fromkeys(members[cluster], "test"))
+
+    # train/val quotas renormalised over what test left behind
+    development = {name: fractions[name] for name in ("train", "val")}
+    remaining = len(cluster_of) - len(assignment)
+    quota = {
+        name: frac / sum(development.values()) * remaining
+        for name, frac in development.items()
+    }
+
+    clusters = [members[c] for c in sorted(members) if c not in reserved]
     random.Random(seed).shuffle(clusters)
 
-    assignment, filled = {}, dict.fromkeys(fractions, 0)
+    filled = dict.fromkeys(development, 0)
 
     def place(cluster, name):
         assignment.update(dict.fromkeys(cluster, name))
@@ -205,20 +267,20 @@ def assign_splits(cluster_of, fractions=FRACTIONS, seed=SEED, guard=GUARD):
         else:
             rest.append(cluster)
     for cluster in rest:
-        place(cluster, min(fractions, key=lambda n: filled[n] / quota[n]))
+        place(cluster, min(development, key=lambda n: filled[n] / quota[n]))
     return assignment
 
 
 def split_dataset(
     graphs, cluster_of=None, seed=SEED, guard=GUARD, fractions=FRACTIONS,
-    path=SPLIT_FILE,
+    path=SPLIT_FILE, test_seed=TEST_SEED,
 ):
     """
-    (train, val, test) lists of Data
+    (train, val, test) lists of Data. test is the same whatever `seed` is.
     """
     if cluster_of is None:
         cluster_of = load_split(path)["clusters"]
-    assignment = assign_splits(cluster_of, fractions, seed, guard)
+    assignment = assign_splits(cluster_of, fractions, seed, guard, test_seed)
 
     out = {name: [] for name in fractions}
     missing = [g.pdb_code for g in graphs if g.pdb_code not in assignment]
@@ -280,9 +342,7 @@ def main(path=SPLIT_FILE):
     assignment = assign_splits(cluster_of)
     sizes = Counter(cluster_of.values())
 
-    # the guarantee the whole module exists for, so it raises rather than prints:
-    # structurally impossible while assign_splits works per cluster, which is
-    # exactly why it costs nothing to assert
+    # the guarantee the whole module exists for
     splits_of_cluster = defaultdict(set)
     for pdb_code, name in assignment.items():
         splits_of_cluster[cluster_of[pdb_code]].add(name)
@@ -300,11 +360,13 @@ def main(path=SPLIT_FILE):
         # the tool version too: without it a split is re-runnable, not
         # reproducible
         "config": {
-            "fractions": FRACTIONS, "seed": SEED, "guard": GUARD,
+            "fractions": FRACTIONS, "seed": SEED, "test_seed": TEST_SEED,
+            "guard": GUARD,
             "n_complexes": len(assignment), "n_clusters": len(sizes),
             "mmseqs_version": mmseqs_version(), "min_seq_id": MIN_SEQ_ID,
             "coverage": COVERAGE, "cov_mode": COV_MODE,
-            "cluster_mode": CLUSTER_MODE,
+            "cluster_mode": CLUSTER_MODE, "sensitivity": SENSITIVITY,
+            "max_seqs": MAX_SEQS, "single_step": SINGLE_STEP,
             "built": date.today().isoformat(),
         },
     }
