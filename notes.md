@@ -29,7 +29,7 @@ the data
 - looking for above 30% similarity ("twilight zone") - below 25-30% similarity, structures are not similar. may be above 40% for long chains. so, want to cluster by about 30% similarity.
 - same for ligands, but will focus on proteins for now otherwise the dataset will shrink a lot. 
 - we started off with 6,934 complexes. 4,944 distinct proteins (same protein vs different ligands).
-    - using mmseqs2 with 30% identity, end up with 1,374 clusters, of which the largest has 532 members. there are 636 clusters of one, and median cluster size is 2.
+    - using mmseqs2 with 30% identity, end up with  
     - so the issue i am foreseeing is there will eb a load of clusters (and the entirety of a cluster needs to go in one of the split,s train/val/test, otherwise the model can learn from the structure and when a protein from the same family is in the test set it could just be learning from the previous structure). don't want to end up with all the biggest clusters in one split and the model ends up training on very similar things. so randomly put in each split until they make up roughly 80/10/10 or similar perc.
     - will put the biggest cluster in train, then randomly assign the others across the splits.
         - this means, then, that the biggest family will never get tested on. but we can try running an experiment on that family by training on others
@@ -224,7 +224,61 @@ predicted band   n     gap    rmse        n     gap    rmse
 - this happens for both the physics and plain one, so it's not solved by physics alone. it's hard to make a comparison here, as n for both is small and n for gcn plain is really small. But physics seems a little better calibrated than the plain one, but need to investigate this further - it could just be chance that seed 3 of gcn plain was best at epoch 0, it doesn't necessarily prove that physics is better.
 - going to update so that we save the train preds, rn only val
 
+
+testing if the physics brnach actually does anything:
+
+- the problem with "physics beats plain" is that the branch bundles 3 separate things, so the result doesn't say which one is affecting results:
+    1. the 1/r + 1/r^6 basis functions
+    2. the coefs w1, w2 being free to depend on r (outputs of previous layers which depend on r)
+    3. the fact that it SUMS over interface edges only, while the main path is a mean pool over all nodes. a sum is extensive (more contacts = bigger number), a mean is size blind. binding energy is extensive and pkd correlates with ligand size, so this alone could be worth something
+- and a 4th problem: gcn_physics has 52228 params vs gcn_plain's 39745, so it might just be that the extra 12483 params help
+
+- leak: edge_attr is (inv_r, inv_r6, log_inv_r6) - ALL of it is distance. and the pair mlp input includes edge_proj(edge_attr). so w1 is literally computed from r:
+    r -> (1/r, 1/r^6, log) -> Linear(3->64) -> part of the 192-dim pair input -> Linear(192->64) -> relu -> Linear(64->2) -> (w1, w2)
+- so w1 = w1(r), and contribution = w1(r)*(1/r) + w2(r)*(1/r^6). set w1(r) = r*g(r) and you get contribution = g(r) i.e. ANY function of r. the 1/r form constrains nothing. it's only a lennard-jones law if w1, w2 are CONSTANTS - like epsilon and sigma in a real force field, which depend on which elements are involved but never on the current distance
+- same as saying y = m*x is a straight line. only true if m is constant. if m = m(x) it can be any curve
+
+tests:
+- gcn_physics_blind: pair mlp gets the edge_type embedding only - a lookup by edge class, so the same 64 numbers for every lig-prot edge no matter the distance. w1, w2 become per-atom-pair-type constants = actual lennard-jones. verified by scaling inv_r/inv_r6 by 2: blind energy changes by exactly 2.000000, full physics by 2.068370. so w is reading r
+- gcn_contact_sum: blind AND terms replaced by 1s, so energy = 0.5*sum(w1+w2) over interface edges. distance only enters through whether the edge exists at all (4A cutoff) - a 2.5A and a 4.0A contact between the same atom types contribute identically. basically contact counting weighted by what atoms are touching
+    - it has to be blind too: if w can read r then w*1 and w*(1/r) span the same functions, so an unblinded contact_sum would just be gcn_physics under another name
+- gcn_plain_wide: plain with hidden 75 instead of 64 -> 52351 params vs 52228,  to see if it's just extra params that improve performance
+- the 3 physics tests have same param count so can compare them between each other
+
+(collapse means jsut uses epoch 0 as best epoch)
+results, 5 seeds, val:
+                    params            rmse          pearson           r2     collapses
+gcn_plain            39745   1.612 +- 0.122   0.255 +- 0.142   0.067          1/5
+gcn_plain_wide       52351   1.622 +- 0.145   0.260 +- 0.142   0.056          1/5
+gcn_contact_sum      52228   1.547 +- 0.094   0.379 +- 0.059   0.141          0/5
+gcn_physics_blind    52228   1.531 +- 0.087   0.403 +- 0.040   0.158          0/5
+gcn_physics          52228   1.531 +- 0.091   0.408 +- 0.037   0.159          0/5
+
+what each test is worth
+capacity alone     plain -> plain_wide       +0.0098  t=+0.30  1/5   p 0.78    nothing
+interface sum      plain -> contact_sum      -0.0653  t=-3.22  5/5   p 0.032   ~80% of it
+1/r, 1/r^6 basis   contact_sum -> blind      -0.0160  t=-1.67  3/5   p 0.17    ~20%
+free distance      blind -> physics          -0.0002  t=-0.04  2/5   p 0.97    nothing
+
+- capacity explains nothing. plain_wide is actually slightly worse than plain, so the effect is architectural. physics vs plain_wide is -0.0913, t=-3.03, p 0.039
+- ~80% of the gain is just having an interface-restricted summed readout head. no distance law needed at all
+- the 1/r + 1/r^6 basis adds ~20% but only 3/5 seeds, t=-1.67, p 0.17. doesn't separate at n=5 and would need ~15 seeds to resolve
+- letting the coefs read r adds NOTHING (-0.0002, blind wins 3/5). so the constrained version means what it says and costs nothing - keep it. the branch was never cheating via the leak, it just isn't the physics doing the lifting
+- collapses: 2/10 runs without the branch collapsed to predicting the mean (best epoch 0), 0/15 with it. and on DIFFERENT seeds (plain on 3, plain_wide on 2) so probs optimiser instability, not a bad split. fisher exact p ~ 0.14 so suggestive, not shown
+
+- stats caveat - the t test here is a paired t on the 5 per-seed rmse diffs (same split for both models each seed, so the val draw cancels). df = 4, 95% crit 2.776. 
+    - everything that clears 0.05 is marginal: p = 0.029, 0.032, 0.039, 0.042, 0.048. nothing comfortable
+    - "5/5 seeds" on its own is NOT significant
+    - and all of this is val, which also picks the early stopping epoch, so absolute numbers are optimistic. same bias for every test so the comparisons are still fair
+
+so just adding the contacts is what's pushing it up
+
+- so far ... physics is doing nothing :)
+
+- and we are massively underfitting
+
+
 to do
 - run holdout test  Run a large-family holdout as a separate experiment: train on everything except the 532-cluster, test on that cluster alone.
-- swap out layernorm for mean agg, perhaps include degree count
-- gcn_physics_blind with the distance removed from the pair input — and a matched-pair comparison. If performance is unchanged, keep the constrained version, because it means what it says.
+- swap out layernorm for mean agg, maybe include degree count
+- directional geometry - h-bonds are angle dependent and we only have distances

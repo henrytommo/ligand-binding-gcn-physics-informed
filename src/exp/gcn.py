@@ -9,6 +9,14 @@
 # the physics sum reads the raw inv_r / inv_r6 columns by name. never point it at
 # log_inv_r6: a log is not an affine rescale, so it would quietly turn
 # Lennard-Jones into a log potential.
+#
+#   gcn_plain          no branch at all
+#   gcn_contact_sum    sum(w(class)) - the interface sum, no distance law
+#   gcn_physics_blind  sum(w(class)/r + w(class)/r^6) - lennard-jones in earnest
+#   gcn_physics        w may read this edge's own r, and w(r)/r is any g(r) it
+#                      likes, so the 1/r form constrains nothing
+# contact_sum is blind for a reason: with w free to read r, w*1 and w*(1/r) span
+# the same functions, so an unblinded contact_sum would just be gcn_physics.
 
 import copy
 import time
@@ -38,6 +46,9 @@ DEFAULTS = {
     "weight_decay": 1e-5,
     "batch_size": 32,
     "physics": True,
+    # the ablations at the top of this file; both off is gcn_physics
+    "physics_blind": False,
+    "physics_constant": False,
 }
 
 
@@ -55,10 +66,16 @@ class PhysicsGCN(nn.Module):
         n_layers=3,
         dropout=0.1,
         physics=True,
+        physics_blind=False,
+        physics_constant=False,
     ):
         super().__init__()
         self.dropout = dropout
         self.physics = physics
+        # blind: the pair mlp is handed the edge class but not this edge's
+        # distances. constant: the sum drops the 1/r, 1/r^6 terms altogether
+        self.physics_blind = physics_blind
+        self.physics_constant = physics_constant
 
         self.element = nn.Embedding(N_ELEMENTS, hidden)
         self.node_type = nn.Embedding(N_NODE_TYPES, hidden)
@@ -107,13 +124,15 @@ class PhysicsGCN(nn.Module):
             + self.node_proj(data.x)
         )
 
-    def _energy(self, data, h, edge_embedding, batch, n_graphs):
+    def _energy(self, data, h, pair_embedding, batch, n_graphs):
         """
         sum(w1/r + w2/r^6) over interface edges, per graph.
 
-        Halved because add_edges stores both directions: correct for message
-        passing, a factor of two for an energy. scatter needs dim_size or a graph
-        with no interface edge drops out and everything after it misaligns with y.
+        `pair_embedding` is what the coefficients may read of each edge: the full
+        embedding, or the class alone when blind. Halved because add_edges stores
+        both directions: correct for message passing, a factor of two for an
+        energy. scatter needs dim_size or a graph with no interface edge drops
+        out and everything after it misaligns with y.
         """
         # one index tensor, so the three reads below do not each re-scan a mask.
         # empty needs no special case - scatter with dim_size returns zeros
@@ -121,9 +140,14 @@ class PhysicsGCN(nn.Module):
 
         src, dst = data.edge_index[:, edges]
         coefficients = self.pair(
-            torch.cat([h[src], h[dst], edge_embedding[edges]], dim=1)
+            torch.cat([h[src], h[dst], pair_embedding[edges]], dim=1)
         )
-        terms = data.edge_attr[edges][:, self.physics_columns]
+        if self.physics_constant:
+            # contact counting: the coefficient is the whole contribution, so
+            # edge_attr is not read at all down this path
+            terms = coefficients.new_ones(coefficients.shape)
+        else:
+            terms = data.edge_attr[edges][:, self.physics_columns]
         energy = 0.5 * (coefficients * terms).sum(dim=1)
         return scatter(energy, batch[src], dim=0, dim_size=n_graphs, reduce="sum")
 
@@ -136,7 +160,10 @@ class PhysicsGCN(nn.Module):
         n_graphs = int(batch.max()) + 1
 
         h = self._node_embedding(data)
-        edge_embedding = self.edge_type(data.edge_type) + self.edge_proj(data.edge_attr)
+        # kept apart so the physics branch can be handed the class alone; message
+        # passing always gets the full embedding, distances included
+        edge_type_embedding = self.edge_type(data.edge_type)
+        edge_embedding = edge_type_embedding + self.edge_proj(data.edge_attr)
 
         for conv, norm in zip(self.convs, self.norms):
             message = F.relu(norm(conv(h, data.edge_index, edge_embedding)))
@@ -147,7 +174,11 @@ class PhysicsGCN(nn.Module):
             # energy_scale starts at 0 so the physics term fades in rather than
             # swamping the learned branch while its coefficients are random
             out = out + self.energy_scale * self._energy(
-                data, h, edge_embedding, batch, n_graphs
+                data,
+                h,
+                edge_type_embedding if self.physics_blind else edge_embedding,
+                batch,
+                n_graphs,
             )
         return out
 
@@ -163,6 +194,8 @@ def _build(params, dims, seed=0, edge_feature_names=None):
         n_layers=params["n_layers"],
         dropout=params["dropout"],
         physics=params["physics"],
+        physics_blind=params.get("physics_blind", False),
+        physics_constant=params.get("physics_constant", False),
     )
 
 
@@ -267,4 +300,22 @@ def _spec(name, **overrides):
 GCN_PHYSICS = _spec("gcn_physics", physics=True)
 GCN_PLAIN = _spec("gcn_plain", physics=False)
 
-MODELS = {spec.name: spec for spec in (GCN_PHYSICS, GCN_PLAIN)}
+# and which part of it earns the place - the ladder at the top of this file
+GCN_PHYSICS_BLIND = _spec("gcn_physics_blind", physics=True, physics_blind=True)
+GCN_CONTACT_SUM = _spec(
+    "gcn_contact_sum", physics=True, physics_blind=True, physics_constant=True
+)
+
+# the capacity control for the plain
+GCN_PLAIN_WIDE = _spec("gcn_plain_wide", physics=False, hidden=75)
+
+MODELS = {
+    spec.name: spec
+    for spec in (
+        GCN_PHYSICS,
+        GCN_PLAIN,
+        GCN_PHYSICS_BLIND,
+        GCN_CONTACT_SUM,
+        GCN_PLAIN_WIDE,
+    )
+}
