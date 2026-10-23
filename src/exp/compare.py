@@ -1,5 +1,4 @@
 # experiments
-#
 # every run writes one directory under data/train, so nothing is overwritten
 
 import argparse
@@ -39,12 +38,15 @@ def _save(out_dir, frames, config):
         json.dump(config, f, indent=2, default=str)
 
 
-def _frames(records, curves, predictions):
-    """one row per model-seed, per epoch, and per scored complex"""
+def _frames(records, curves, predictions, train_predictions):
+    """one row per model-seed, per epoch, per scored complex, per train complex"""
     return {
         "metrics": pd.DataFrame(records),
         "curve": pd.DataFrame(curves),
         "predictions": pd.DataFrame(predictions),
+        # its own file rather than extra rows in predictions.csv, which
+        # everything downstream reads as "the scored set and nothing else"
+        "train_predictions": pd.DataFrame(train_predictions),
     }
 
 
@@ -95,7 +97,7 @@ def run(
     }
     del raw, blob
 
-    records, curves, predictions = [], [], []
+    records, curves, predictions, train_predictions = [], [], [], []
     started_all = time.perf_counter()
 
     for seed in seeds:
@@ -160,6 +162,16 @@ def run(
                 }
                 for graph, true, predicted in zip(scored, result.y_true, result.y_pred)
             ]
+            # train as well, for recalibration
+            train_true, train_pred = spec.predict(result.model, train, result.target)
+            train_predictions += [
+                {
+                    "seed": seed, "model": spec.name, "scored": "train",
+                    "pdb_code": graph.pdb_code,
+                    "y_true": float(true), "y_pred": float(predicted),
+                }
+                for graph, true, predicted in zip(train, train_true, train_pred)
+            ]
             if out_dir is not None and hasattr(result.model, "state_dict"):
                 torch.save(
                     result.model.state_dict(), out_dir / f"{spec.name}_seed{seed}.pt"
@@ -176,14 +188,14 @@ def run(
             if out_dir is not None:
                 _save(
                     out_dir,
-                    _frames(records, curves, predictions),
+                    _frames(records, curves, predictions, train_predictions),
                     _config(
                         meta, specs, score, dataset_config, split["config"],
                         started_all,
                     ),
                 )
 
-    return _frames(records, curves, predictions)
+    return _frames(records, curves, predictions, train_predictions)
 
 
 def summarise(frame):

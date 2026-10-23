@@ -64,6 +64,9 @@ class Result(NamedTuple):
     metrics: dict
     y_true: np.ndarray
     y_pred: np.ndarray
+    # the fitted encoding, so a caller can predict on another set (train) with
+    # the statistics this fit used, rather than refitting them and hoping
+    target: Target
 
 
 def evaluate(spec, train, val, test, params=None, seed=0, score="val"):
@@ -82,4 +85,4 @@ def evaluate(spec, train, val, test, params=None, seed=0, score="val"):
     model = spec.build(params, dims_of(train), seed, spec.edge_features)
     model = spec.fit(model, train, val, params, target)
     y_true, y_pred = spec.predict(model, {"val": val, "test": test}[score], target)
-    return Result(model, regression_metrics(y_true, y_pred), y_true, y_pred)
+    return Result(model, regression_metrics(y_true, y_pred), y_true, y_pred, target)

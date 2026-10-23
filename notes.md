@@ -147,10 +147,82 @@ gcn.py
 - ok another issue: 
 
 - running against the (admittedly primitive) baselines, this took about 2 hours
-- r2 measures how much better the model is than predicting the actual pkd mean (note, baseline scores can be negative bc they use train mean whereas r2 is test mean)
-    - similar to rmse, just tells in a differwnt way
+- r2 measures how much better the model is than predicting the pkd mean each time (note, baseline scores can be negative bc they use train mean whereas r2 is test mean)
+    - r2 = 1 - (rmse / val_std)^2 of that seed's val set
+    - r2 > 0.75v means it's a better model than just predicting mean
 
 - the run died - ran out of memory, updating so it saves incrementally so i don't lose everything when it stops
+
+results
+                   gcn_physics        gcn_plain
+rmse            1.531 +- 0.091   1.612 +- 0.122
+mae             1.203 +- 0.058   1.259 +- 0.090
+pearson         0.408 +- 0.037   0.255 +- 0.142
+spearman        0.410 +- 0.041   0.241 +- 0.135
+r2              0.159 +- 0.037   0.067 +- 0.063
+
+best_epoch       14.8 +-   6.3    20.2 +-  19.4
+epochs_run       25.8 +-   6.3    31.2 +-  19.4
+seconds         639   +- 153     739   +- 460
+
+- the physics informed gcn is better on all 5 metrics, and also has a lower variance. it also reaches it's best epoch in fewer iterations and slighlty less time, although variance is larger for gcn (likely dues to seed 3 finishing on epoch 0)
+- r2 score is pretty low: 0.159 for gcn physics, so not a whole let better than the mean (but, better than gcn plain at least)
+
+ looking seed by seed:
+
+         rmse                      mae                       r2                     pearson                   spearman                  best epoch / num epochs
+seed    phys   plain    diff      phys   plain    diff      phys   plain    diff    phys   plain    diff      phys   plain    diff      phys      plain
+   0   1.482   1.536  -0.054     1.182   1.209  -0.027     0.096   0.028  +0.068   0.344   0.236  +0.108     0.342   0.216  +0.126     23/34     13/24
+   1   1.520   1.541  -0.021     1.235   1.218  +0.017     0.188   0.165  +0.023   0.436   0.419  +0.017     0.435   0.395  +0.040     10/21     50/61
+   2   1.664   1.757  -0.093     1.212   1.299  -0.087     0.162   0.066  +0.096   0.412   0.299  +0.113     0.421   0.277  +0.144     17/28     28/39
+   3   1.564   1.731  -0.167     1.271   1.396  -0.125     0.183  -0.001  +0.184   0.430   0.030  +0.400     0.445   0.029  +0.417     17/28      0/11
+   4   1.423   1.495  -0.072     1.117   1.171  -0.054     0.163   0.076  +0.087   0.417   0.291  +0.126     0.408   0.289  +0.119      7/18     10/21
+
+- pearson is showing correlation: not super high, but better for physics (also only shows correlation, not if the pkd values are close, hence need other metrics for calibration)
+- spearman: shows the rank. again not super high, and note that this is across all proteins, not looking at rank within protein family (which might be interesting)
+
+looking at baselines:
+seed  n_val  val_std  baseline_mean  physics pred_std  plain pred_std
+   0    697    1.559          1.600              0.753           0.531
+   1    704    1.686          1.730              0.676           0.856
+   2    693    1.819          1.935              0.715           0.717
+   3    701    1.730          1.750              0.768           0.040
+   4    698    1.556          1.611              0.553           0.586
+
+and then looking at the span of pkd - i.e. how wide a variation of pkd the data covers
+seed  y_true span  physics span  plain span
+   0        10.20          4.25        3.42
+   1         8.66          4.39        5.91
+   2        13.64          4.75        4.19
+   3        11.37          4.78        0.24
+   4         9.34          3.65        3.12
+
+can see that both the gcns predict within a really narrow span. seed 3 for the plain gcn is really narrow, and best epoch was 0, so it didnt improve upon that in the patience. already saw above that physics gets better in fewer epochs.
+
+
+- Seed 0 — physics's weakest seed by correlation (pearson 0.344, r2 0.096) despite an easy val draw (std 1.559). It also ran longest to get there, best epoch 23. Both models underperform their other seeds here, so it looks like a hard train draw rather than a hard val one.
+- Seed 1 — the one seed where the two are near-equivalent: diff −0.021 rmse, +0.017 pearson, and plain actually wins mae by 0.017. Plain got there by training 61 epochs to physics's 21, peaking at epoch 50 (its longest run, 1432 s vs 530 s). So on this draw plain can match physics, but needs ~2.7x the compute.
+- Seed 2 — the hardest val draw (std 1.819, baseline_mean rmse 1.935). Both models' absolute rmse is worst here, but their relative standing is normal. This is the seed that most inflates the sd columns.
+- Seed 3 — plain collapsed. Prediction span 0.24 pKd (5.46–5.70), pred_std 0.040, best val loss at epoch 0, stopped after 11 epochs. Early stopping restored the epoch-0 weights, so that result is an essentially untrained network emitting the mean — hence r2 −0.001 and pearson 0.030, both indistinguishable from baseline_mean. Physics on the same split is entirely normal (0.430 pearson, best epoch 17). Every "biggest gap" in the diff columns is this one failure.
+- Seed 4 — the easiest draw and the best absolute numbers for both (physics rmse 1.423, r2 0.163). Physics converged fastest here, best epoch 7.
+
+
+- looking at how different pkd bands are predicted:
+                 gcn_physics              gcn_plain
+predicted band   n     gap    rmse        n     gap    rmse
+(0.0, 4.5]      164  +0.085   1.446      181  -0.295   1.609
+(4.5, 5.0]      642  +0.179   1.574      476  -0.135   1.501
+(5.0, 5.5]     1031  -0.085   1.479      879  -0.106   1.488
+(5.5, 6.0]      904  -0.102   1.544     1353  -0.007   1.624
+(6.0, 6.5]      410  -0.041   1.590      391  +0.200   1.800
+(6.5, 7.0]      206  +0.127   1.444      159  +0.281   1.952
+(7.0, 7.5]       91  +0.259   1.479       41  +0.472   2.008
+(7.5, 20.0]      45  +1.175   2.085       13  +0.232   1.411
+(gap = pred_mean − true_mean; positive means predicting higher pkd than true)
+
+- looks like pkd over about 7 is worse: the pred mean is further away. admittedly, there are fewer examples in this band, but we are looking for higher pkd - i.e. complexes that bind more strongly (if this were a model to predict ligand binding targets, for example)
+- this happens for both the physics and plain one, so it's not solved by physics alone. it's hard to make a comparison here, as n for both is small and n for gcn plain is really small. But physics seems a little better calibrated than the plain one, but need to investigate this further - it could just be chance that seed 3 of gcn plain was best at epoch 0, it doesn't necessarily prove that physics is better.
+- going to update so that we save the train preds, rn only val
 
 to do
 - run holdout test  Run a large-family holdout as a separate experiment: train on everything except the 532-cluster, test on that cluster alone.
