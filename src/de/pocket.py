@@ -5,24 +5,23 @@ import pandas as pd
 from biopandas.pdb import PandasPdb
 from rdkit import Chem
 
-from config import NODE_COFACTOR, NODE_METAL, NODE_PROTEIN
+from de.config import (
+    N_ELEMENTS,
+    NODE_COFACTOR,
+    NODE_METAL,
+    NODE_PROTEIN,
+    RESIDUE_NAME_TO_INDEX,
+    RESIDUE_OTHER,
+)
+from de.residues import chain_residue_keys
 
-# only water. crystallisation additives (GOL, EDO, SO4) stay as cofactor nodes,
-# since some of them do sit in the pocket
+# only water removed. some other solvents sit in the pocket
 SOLVENT_RESNAMES = frozenset({"HOH", "DOD"})
 
-# H positions are inferred in x-ray structures anyway. D is neutron-structure
-# deuterium, in no periodic table, so it must go before the lookup below
+# H ad D removed
 NON_HEAVY_ELEMENTS = frozenset({"H", "D"})
 
-# all three mark a chain residue, whatever it is called - which is what tells a
-# modified residue (MSE, KCX, SEP: HETATM but covalently in the backbone) from a
-# cofactor. all three, because a lone calcium ion is also an atom named CA
-BACKBONE_ATOMS = frozenset({"N", "CA", "C"})
-
-# metals by atomic number, metalloids deliberately excluded - Se above all,
-# since selenomethionine is a chain residue and not a coordinating ion. B, Si,
-# Ge, As, Sb, Te are out for the same reason: they turn up in covalent groups
+# metals by atomic number, metalloids excluded as they participate in covalent bonding
 METAL_ATOMIC_NUMS = frozenset(
     {3, 4, 11, 12, 13}             # Li Be Na Mg Al
     | set(range(19, 32))           # K Ca, the first row transition metals, Ga
@@ -31,78 +30,69 @@ METAL_ATOMIC_NUMS = frozenset(
     | set(range(87, 119))          # Fr Ra and the actinides
 )
 
-# uppercase keys, as the pdb element column is written, covering metals,
-# halogens and Se. from rdkit rather than hand listed, and read through a dict so
-# an unknown symbol raises our error, not rdkit's c++ post-condition violation
+# classify as an array index
+IS_METAL = np.zeros(N_ELEMENTS, dtype=bool)
+IS_METAL[list(METAL_ATOMIC_NUMS)] = True
+
+# uppercase keys - elements uppercase in pdb
 PERIODIC_TABLE = Chem.GetPeriodicTable()
 ELEMENT_TO_ATOMIC_NUM = {
-    PERIODIC_TABLE.GetElementSymbol(z).upper(): z for z in range(1, 119)
+    PERIODIC_TABLE.GetElementSymbol(z).upper(): z for z in range(1, N_ELEMENTS)
 }
 
 
 def _classify_atoms(atoms, atomic_nums):
     """
-    NODE_PROTEIN for atoms of a residue with a complete N/CA/C backbone, then
-    NODE_METAL for metal atoms, then NODE_COFACTOR for the rest.
-
-    The chain test comes first and wins, so the Fe of a heme and a bare Zn2+ are
-    both metals while the Se of selenomethionine stays protein. Structural
-    rather than a residue-name whitelist, which goes stale against the pdb's
-    thousand-plus modified residue codes.
-
-    Caveat: a free amino acid bound as a cofactor passes the backbone test and
-    is called protein. Rare, and hard to separate without the chain topology.
+    NODE_PROTEIN for atoms of a chain residue (see de.residues), then NODE_METAL
+    for metal atoms, then NODE_COFACTOR for the rest.
+    Chain is last so if any fit into 2 categories, chain wins
+    possible bug: free amino acid is classified as a protein
     """
-    keys = list(zip(atoms["chain_id"], atoms["residue_number"], atoms["insertion"]))
-    names = atoms["atom_name"].str.strip().str.upper()
+    # zip as numpy for speed
+    keys = list(
+        zip(
+            atoms["chain_id"].to_numpy(),
+            atoms["residue_number"].to_numpy(),
+            atoms["insertion"].to_numpy(),
+        )
+    )
+    chain_keys = chain_residue_keys(keys, atoms["atom_name"].to_numpy())
 
-    backbone_seen = {}
-    for key, name in zip(keys, names):
-        if name in BACKBONE_ATOMS:
-            backbone_seen.setdefault(key, set()).add(name)
-
-    node_types = []
-    for key, atomic_num in zip(keys, atomic_nums):
-        if BACKBONE_ATOMS <= backbone_seen.get(key, frozenset()):
-            node_types.append(NODE_PROTEIN)
-        elif atomic_num in METAL_ATOMIC_NUMS:
-            node_types.append(NODE_METAL)
-        else:
-            node_types.append(NODE_COFACTOR)
-    return np.array(node_types, dtype=np.int8)
+    node_types = np.where(
+        IS_METAL[atomic_nums], NODE_METAL, NODE_COFACTOR
+    ).astype(np.int8)
+    for i, key in enumerate(keys):
+        if key in chain_keys:
+            node_types[i] = NODE_PROTEIN
+    return node_types
 
 
 def parse_pocket(pdb_path):
     """
-    Returns {"coords", "atomic_nums", "node_types", "atoms"} for one pocket.
+    Returns {"coords", "atomic_nums", "node_types", "residue_types", "atoms"}.
 
-    Reads ATOM and HETATM: HETATM is where the catalytic metals (Zn, Mg, Mn, Fe,
-    Ca), cofactors (PLP, NAG, LLP) and modified chain residues (MSE, KCX, SEP)
-    live, so ATOM alone discards most of the chemistry that decides binding.
+    Reads ATOM and HETATM: HETATM holds the catalytic metals, the cofactors,
+    and modified chain residues, so ATOM by itslef loses most of the binding chem
 
-    "atoms" is the filtered frame, kept so a featurizer can reach residue names
-    or b-factors without re-reading, and for a later sequence-identity split. Its
-    element_symbol column is stripped and uppercased.
+    "residue_types" is amino acid identity per atom, so an oxygen in one amino
+    acid behaves differently to one in another.  a residue outside AA3_TO_1 falls 
+    to RESIDUE_OTHER rather than guess.
 
-    Raises ValueError if nothing survives filtering, or on an element symbol
-    outside the periodic table - which used to become atomic number 0, a node
-    with real coordinates and no identity.
+    Raises ValueError if nothing survives filtering, or on fake element
     """
     ppdb = PandasPdb().read_pdb(str(pdb_path))
     atoms = pd.concat([ppdb.df["ATOM"], ppdb.df["HETATM"]], ignore_index=True)
-    # normalised once, so the rest of this function and anything reading the
-    # returned frame can use the column as it stands
-    atoms["element_symbol"] = atoms["element_symbol"].str.strip().str.upper()
+    # normlaise cols
+    for column in ("element_symbol", "residue_name", "atom_name"):
+        atoms[column] = atoms[column].str.strip().str.upper()
 
     atoms = atoms[
-        ~atoms["residue_name"].str.strip().str.upper().isin(SOLVENT_RESNAMES)
+        ~atoms["residue_name"].isin(SOLVENT_RESNAMES)
         & ~atoms["element_symbol"].isin(NON_HEAVY_ELEMENTS)
     ]
 
-    # alternate conformers repeat an atom at two positions, duplicating the node
-    # and leaving a spurious ~0.1 A edge between the copies. atom names are
-    # unique within a residue, so first-occurrence keeps the conformer the file
-    # lists first, and handles altloc codes beyond A/B
+    # alternate conformers: same atom but 2 locs, due to diffraction pattern
+    # drop dupes
     atoms = atoms.drop_duplicates(
         subset=["chain_id", "residue_number", "insertion", "atom_name"],
         keep="first",
@@ -118,9 +108,16 @@ def parse_pocket(pdb_path):
     atomic_nums = (
         atoms["element_symbol"].map(ELEMENT_TO_ATOMIC_NUM).to_numpy(dtype=np.int16)
     )
+    residue_types = (
+        atoms["residue_name"]
+        .map(RESIDUE_NAME_TO_INDEX)
+        .fillna(RESIDUE_OTHER)
+        .to_numpy(dtype=np.int8)
+    )
     return {
         "coords": atoms[["x_coord", "y_coord", "z_coord"]].to_numpy(dtype=np.float32),
         "atomic_nums": atomic_nums,
         "node_types": _classify_atoms(atoms, atomic_nums),
+        "residue_types": residue_types,
         "atoms": atoms,
     }
