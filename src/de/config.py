@@ -27,11 +27,46 @@ N_NODE_TYPES = NODE_METAL + 1
 # atomic numbers 1..118 are an embedding not linear feature
 N_ELEMENTS = 119
 
+# lennard-jones types, one learned well depth each
+LJ_TYPE_OTHER = 9
+LJ_TYPE_METAL = 10
+N_LJ_TYPES = LJ_TYPE_METAL + 1
+
+_LJ_BY_ELEMENT = {6: 0, 7: 1, 8: 2, 16: 3, 15: 4, 9: 5, 17: 6, 35: 7, 53: 8}
+_LJ_METALS = frozenset(
+    (3, 4, 11, 12, 13, 19, 20, 23, 24, 25, 26, 27, 28, 29, 30, 38, 39, 44, 45,
+     47, 48, 49, 55, 56, 63, 70, 77, 78, 79, 80, 82)
+)
+# indexed by atomic number, so the model builds one lookup buffer and never
+# does a dict get per atom
+LJ_TYPE_OF = tuple(
+    _LJ_BY_ELEMENT.get(z, LJ_TYPE_METAL if z in _LJ_METALS else LJ_TYPE_OTHER)
+    for z in range(N_ELEMENTS)
+)
+
+# coarse lj, i.e. c, n, o
+LJ_COARSE_REMAINDER = 3
+N_LJ_TYPES_COARSE = LJ_COARSE_REMAINDER + 1
+LJ_TYPE_OF_COARSE = tuple(
+    {6: 0, 7: 1, 8: 2}.get(z, LJ_COARSE_REMAINDER) for z in range(N_ELEMENTS)
+)
+
+# chosen by name, so a run's config.json records "fine" or "coarse" instead of
+# a 119-entry tuple
+LJ_TAXONOMIES = {
+    "fine": (LJ_TYPE_OF, N_LJ_TYPES),
+    "coarse": (LJ_TYPE_OF_COARSE, N_LJ_TYPES_COARSE),
+}
+
 # 2 atoms closer than this (in angstrom) are same atoms - not 2 different
 COINCIDENT_DISTANCE = 0.5
 
 # angstrom, non-covalent bond range (vdw and h)
 DISTANCE_CUTOFF = 4.0
+
+# angstrom, for pairs with exactly one ligand end - which is exactly the set the
+# energy branch sums over. equal to DISTANCE_CUTOFF, i.e. symmetric by default.
+INTERFACE_DISTANCE_CUTOFF = DISTANCE_CUTOFF
 
 # three letter residue names to one letter codes, shared by the residue 
 # embedding and split.py's sequence extraction

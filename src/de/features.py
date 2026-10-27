@@ -95,7 +95,7 @@ def _distance(ctx):
     return _column(ctx["distances"])
 
 
-# angstrom. equal to config.DISTANCE_CUTOFF
+# angstrom. a FIXED scale, deliberately not read from config
 _REFERENCE_DISTANCE = 4.0
 
 

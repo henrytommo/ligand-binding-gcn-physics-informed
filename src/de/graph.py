@@ -8,6 +8,7 @@ from de import features
 from de.config import (
     COINCIDENT_DISTANCE,
     DISTANCE_CUTOFF,
+    INTERFACE_DISTANCE_CUTOFF,
     NODE_COFACTOR,
     NODE_LIGAND,
     NODE_METAL,
@@ -135,10 +136,20 @@ def _classify_edges(edge_index, node_type, lig_bond_index):
     return edge_type
 
 
-def add_edges(data, distance_cutoff=DISTANCE_CUTOFF, edge_feature_names=None):
+def add_edges(
+    data,
+    distance_cutoff=DISTANCE_CUTOFF,
+    interface_cutoff=INTERFACE_DISTANCE_CUTOFF,
+    edge_feature_names=None,
+):
     """
     Build the radius graph for one Data in place, setting edge_index, edge_attr
     and edge_type. Returns the same object, so it works as a pyg transform.
+
+    Two radii: `interface_cutoff` for pairs with exactly one ligand end, and
+    `distance_cutoff` for everything else. A pair's class follows from node_type
+    alone, so which radius applies is known before any distance is compared -
+    nothing circular about choosing the cutoff per class.
 
     Both directions of each pair are kept, as pyg message passing expects.
     """
@@ -146,7 +157,14 @@ def add_edges(data, distance_cutoff=DISTANCE_CUTOFF, edge_feature_names=None):
         edge_feature_names = features.DEFAULT_EDGE_FEATURES
 
     distance_matrix = torch.cdist(data.pos, data.pos)
-    within = distance_matrix < distance_cutoff
+    ligand = data.node_type == NODE_LIGAND
+    # xor: EXACTLY one end a ligand atom, which is precisely INTERFACE_EDGES.
+    # ligand-ligand keeps the narrow radius - it is intramolecular, and the
+    # energy sums no term for it
+    interface = ligand.unsqueeze(1) ^ ligand.unsqueeze(0)
+    # a per-pair radius rather than two masked comparisons or-ed together, so
+    # this stays correct if the interface radius is ever set BELOW the other
+    within = distance_matrix < torch.where(interface, interface_cutoff, distance_cutoff)
     # clear the diagonal in place rather than filtering an edge list afterwards,
     # which would copy the whole list to drop the self-loops
     within.fill_diagonal_(False)

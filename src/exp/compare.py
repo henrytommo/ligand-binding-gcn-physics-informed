@@ -12,7 +12,7 @@ import pandas as pd
 import torch
 
 from de.build import load_dataset
-from de.config import DISTANCE_CUTOFF, TRAIN_DIR
+from de.config import DISTANCE_CUTOFF, INTERFACE_DISTANCE_CUTOFF, TRAIN_DIR
 from de.graph import add_edges
 from de.split import holdout_cluster, load_split, split_dataset
 from exp.baselines import BASELINES
@@ -23,11 +23,19 @@ from exp.spec import evaluate
 REGISTRY = {**MODELS, **BASELINES}
 
 
-def prepare(graphs, edge_feature_names):
+def prepare(graphs, edge_feature_names, cutoff, interface_cutoff):
     """
     Cached graphs with edges built for one edge feature set. edges not cached
     """
-    return [add_edges(g.clone(), edge_feature_names=edge_feature_names) for g in graphs]
+    return [
+        add_edges(
+            g.clone(),
+            distance_cutoff=cutoff,
+            interface_cutoff=interface_cutoff,
+            edge_feature_names=edge_feature_names,
+        )
+        for g in graphs
+    ]
 
 
 def _save(out_dir, frames, config):
@@ -50,7 +58,10 @@ def _frames(records, curves, predictions, train_predictions):
     }
 
 
-def _config(meta, specs, score, dataset_config, split_config, started):
+def _config(
+    meta, specs, score, dataset_config, split_config, started, cutoff,
+    interface_cutoff,
+):
     """everything needed to trace a result back to the code and data"""
     return {
         **(meta or {}),
@@ -62,7 +73,8 @@ def _config(meta, specs, score, dataset_config, split_config, started):
             for spec in specs
         },
         "scored": score,
-        "cutoff": DISTANCE_CUTOFF,
+        "cutoff": cutoff,
+        "interface_cutoff": interface_cutoff,
         "dataset": dataset_config,
         "split": split_config,
         "elapsed_seconds": round(time.perf_counter() - started, 1),
@@ -75,6 +87,7 @@ def _config(meta, specs, score, dataset_config, split_config, started):
 def run(
     names, seeds, mode="split", limit=None, guard=None, max_epochs=None,
     patience=None, progress=False, score="val", out_dir=None, meta=None,
+    cutoff=DISTANCE_CUTOFF, interface_cutoff=INTERFACE_DISTANCE_CUTOFF,
 ):
     """
     Fit every spec on every seed, scoring `score` ("val" while developing, so
@@ -92,7 +105,7 @@ def run(
     # one prepared copy per DISTINCT edge feature set - dict.fromkeys dedupes
     # while keeping the order, unprepared graphs go (save memory)
     prepared = {
-        edge_features: prepare(raw, edge_features)
+        edge_features: prepare(raw, edge_features, cutoff, interface_cutoff)
         for edge_features in dict.fromkeys(spec.edge_features for spec in specs)
     }
     del raw, blob
@@ -141,9 +154,10 @@ def run(
                     "n_train": len(train),
                     "n_val": len(val),
                     "n_test": len(test),
-                    # the cutoff is an experiment parameter now that edges are
+                    # the cutoffs are experiment parameters now that edges are
                     # built at load time, so record here
-                    "cutoff": DISTANCE_CUTOFF,
+                    "cutoff": cutoff,
+                    "interface_cutoff": interface_cutoff,
                     "edge_features": "+".join(spec.edge_features),
                     "guard": guard,
                     "epochs_run": len(history),
@@ -191,7 +205,7 @@ def run(
                     _frames(records, curves, predictions, train_predictions),
                     _config(
                         meta, specs, score, dataset_config, split["config"],
-                        started_all,
+                        started_all, cutoff, interface_cutoff,
                     ),
                 )
 
@@ -236,6 +250,15 @@ if __name__ == "__main__":
     parser.add_argument("--mode", choices=("split", "holdout"), default="split")
     parser.add_argument("--limit", type=int, help="use only the first N complexes")
     parser.add_argument("--guard", type=float, help="override the large-cluster guard")
+    parser.add_argument(
+        "--cutoff", type=float, default=DISTANCE_CUTOFF,
+        help="edge radius for pairs that are not ligand-to-other",
+    )
+    parser.add_argument(
+        "--interface-cutoff", type=float, default=INTERFACE_DISTANCE_CUTOFF,
+        dest="interface_cutoff",
+        help="edge radius for ligand-to-other pairs, the set the energy sums",
+    )
     parser.add_argument("--max-epochs", type=int, dest="max_epochs")
     parser.add_argument("--patience", type=int, help="override early stopping patience")
     parser.add_argument(
@@ -266,6 +289,7 @@ if __name__ == "__main__":
         args.models, seeds, args.mode, args.limit, args.guard,
         args.max_epochs, args.patience, args.progress, args.score,
         out_dir=out_dir, meta={"run_id": run_id, "args": vars(args)},
+        cutoff=args.cutoff, interface_cutoff=args.interface_cutoff,
     )
     summarise(frames["metrics"])
     print(f"\nwrote {out_dir}")

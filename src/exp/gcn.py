@@ -15,10 +15,18 @@
 #   gcn_physics_blind  sum(w(class)/r + w(class)/r^6) - lennard-jones in earnest
 #   gcn_physics        w may read this edge's own r, and w(r)/r is any g(r) it
 #                      likes, so the 1/r form constrains nothing
+#   gcn_lj             -eps(i,j) * (r_min/r)^6, r_min FIXED at the sum of the
+#                      two literature vdw radii and eps the only learned thing.
+#                      enters the readout at -1, so a favourable (negative)
+#                      energy raises the predicted pKd. 11 parameters against
+#                      gcn_physics's ~12k, and nothing in it may read the
+#                      learned embeddings, so here the r^-6 form really does
+#                      constrain
 # contact_sum is blind for a reason: with w free to read r, w*1 and w*(1/r) span
 # the same functions, so an unblinded contact_sum would just be gcn_physics.
 
 import copy
+import math
 import time
 
 import torch
@@ -29,7 +37,12 @@ from torch_geometric.nn import GINEConv, global_mean_pool
 from torch_geometric.utils import scatter
 
 from de import features
-from de.config import N_ELEMENTS, N_NODE_TYPES, N_RESIDUE_TYPES
+from de.config import (
+    LJ_TAXONOMIES,
+    N_ELEMENTS,
+    N_NODE_TYPES,
+    N_RESIDUE_TYPES,
+)
 from de.graph import INTERFACE_EDGES, N_EDGE_TYPES
 from exp.spec import ModelSpec
 
@@ -49,6 +62,11 @@ DEFAULTS = {
     # the ablations at the top of this file; both off is gcn_physics
     "physics_blind": False,
     "physics_constant": False,
+    "physics_lj": False,
+    # the well depth every lj type starts at
+    "physics_lj_eps_init": 0.01,
+    # which eps taxonomy: "fine" is 11 types, "coarse" is C/N/O plus a pool
+    "physics_lj_types": "fine",
 }
 
 
@@ -68,14 +86,19 @@ class PhysicsGCN(nn.Module):
         physics=True,
         physics_blind=False,
         physics_constant=False,
+        physics_lj=False,
+        physics_lj_eps_init=0.01,
+        physics_lj_types="fine",
     ):
         super().__init__()
         self.dropout = dropout
         self.physics = physics
         # blind: the pair mlp is handed the edge class but not this edge's
-        # distances. constant: the sum drops the 1/r, 1/r^6 terms altogether
+        # distances. constant: the sum drops the 1/r, 1/r^6 terms altogether.
+        # lj: no pair mlp at all, one learned well depth per element type
         self.physics_blind = physics_blind
         self.physics_constant = physics_constant
+        self.physics_lj = physics_lj
 
         self.element = nn.Embedding(N_ELEMENTS, hidden)
         self.node_type = nn.Embedding(N_NODE_TYPES, hidden)
@@ -107,11 +130,40 @@ class PhysicsGCN(nn.Module):
             self.register_buffer("physics_columns", torch.tensor(columns))
             self.register_buffer("interface_edges", torch.tensor(INTERFACE_EDGES))
 
-            # per-pair coefficients for (1/r, 1/r^6) from both endpoint
-            # embeddings plus the edge class, so metal coordination can take a
-            # different coefficient from an ordinary contact
-            self.pair = _mlp(3 * hidden, hidden, len(columns))
-            self.energy_scale = nn.Parameter(torch.zeros(1))
+            if physics_lj:
+                # geometry fixed, depth learned. r_min is the sum of the two
+                # literature vdw radii: the r_min convention puts the well
+                # where the atoms touch, so no 2^(1/6) sigma conversion arises
+                # to be got wrong. per ELEMENT, finer than the eps types
+                self.register_buffer(
+                    "vdw_radius", torch.from_numpy(features.VDW_RADII)
+                )
+                # the taxonomy sets the DEPTHS only; r_min above stays per
+                # element, so coarsening costs no geometry
+                lj_type_of, n_lj_types = LJ_TAXONOMIES[physics_lj_types]
+                self.register_buffer("lj_type", torch.tensor(lj_type_of))
+                # r comes back out of the inv_r column, so this needs no new
+                # edge feature and edge_feat_dim still matches every run on disk
+                self.register_buffer(
+                    "inv_r_column", torch.tensor(edge_feature_names.index("inv_r"))
+                )
+                # softplus keeps every depth positive, so eps IS a well depth
+                # and the term cannot quietly turn repulsive
+                self.raw_eps = nn.Parameter(
+                    torch.full(
+                        (n_lj_types,), math.log(math.expm1(physics_lj_eps_init))
+                    )
+                )
+                # -1, because _energy returns an ENERGY and the target is a pKd:
+                # a favourable interaction is negative in energy and LARGE in
+                # pKd = -log10(Kd), so d(pKd)/d(energy) has to be negative
+                self.register_buffer("energy_scale", -torch.ones(1))
+            else:
+                # per-pair coefficients for (1/r, 1/r^6) from both endpoint
+                # embeddings plus the edge class, so metal coordination can take
+                # a different coefficient from an ordinary contact
+                self.pair = _mlp(3 * hidden, hidden, len(columns))
+                self.energy_scale = nn.Parameter(torch.zeros(1))
 
     def _node_embedding(self, data):
         # summing embeddings plus a projection of x is the same linear map as
@@ -129,7 +181,9 @@ class PhysicsGCN(nn.Module):
         sum(w1/r + w2/r^6) over interface edges, per graph.
 
         `pair_embedding` is what the coefficients may read of each edge: the full
-        embedding, or the class alone when blind. Halved because add_edges stores
+        embedding, or the class alone when blind. The lj path reads NEITHER h nor
+        pair_embedding - its depth comes from the element alone and its geometry
+        from a fixed table, which is the whole point of it. Halved because add_edges stores
         both directions: correct for message passing, a factor of two for an
         energy. scatter needs dim_size or a graph with no interface edge drops
         out and everything after it misaligns with y.
@@ -139,6 +193,20 @@ class PhysicsGCN(nn.Module):
         edges = torch.isin(data.edge_type, self.interface_edges).nonzero().squeeze(-1)
 
         src, dst = data.edge_index[:, edges]
+        if self.physics_lj:
+            element = data.atomic_num
+            r_min = self.vdw_radius[element[src]] + self.vdw_radius[element[dst]]
+            # inv_r already carries the 0.5A floor add_edges applied, so r here
+            # is exactly the r every other part of the model sees
+            ratio = r_min * data.edge_attr[edges][:, self.inv_r_column]
+            # a flat-bottomed well: clamping the ratio at 1 caps each pair at
+            # exactly -eps
+            attraction = ratio.clamp(max=1.0).pow(6)
+            depth = F.softplus(self.raw_eps)[self.lj_type[element]]
+            pair_depth = torch.sqrt(depth[src] * depth[dst])
+            energy = -0.5 * pair_depth * attraction
+            return scatter(energy, batch[src], dim=0, dim_size=n_graphs, reduce="sum")
+
         coefficients = self.pair(
             torch.cat([h[src], h[dst], pair_embedding[edges]], dim=1)
         )
@@ -196,6 +264,9 @@ def _build(params, dims, seed=0, edge_feature_names=None):
         physics=params["physics"],
         physics_blind=params.get("physics_blind", False),
         physics_constant=params.get("physics_constant", False),
+        physics_lj=params.get("physics_lj", False),
+        physics_lj_eps_init=params.get("physics_lj_eps_init", 0.01),
+        physics_lj_types=params.get("physics_lj_types", "fine"),
     )
 
 
@@ -309,6 +380,20 @@ GCN_CONTACT_SUM = _spec(
 # the capacity control for the plain
 GCN_PLAIN_WIDE = _spec("gcn_plain_wide", physics=False, hidden=75)
 
+# option A of lennard-jones: geometry taken from rdkit, depth
+# learned.
+GCN_LJ = _spec("gcn_lj", physics=True, physics_lj=True)
+
+# identical but for the eps init
+GCN_LJ_EPS03 = _spec(
+    "gcn_lj_eps03", physics=True, physics_lj=True, physics_lj_eps_init=0.03
+)
+
+# 4 depths instead of 11: C, N, O and everything else pooled
+GCN_LJ_COARSE = _spec(
+    "gcn_lj_coarse", physics=True, physics_lj=True, physics_lj_types="coarse"
+)
+
 MODELS = {
     spec.name: spec
     for spec in (
@@ -317,5 +402,8 @@ MODELS = {
         GCN_PHYSICS_BLIND,
         GCN_CONTACT_SUM,
         GCN_PLAIN_WIDE,
+        GCN_LJ,
+        GCN_LJ_EPS03,
+        GCN_LJ_COARSE,
     )
 }

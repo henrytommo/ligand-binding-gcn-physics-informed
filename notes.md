@@ -277,6 +277,143 @@ so just adding the contacts is what's pushing it up
 
 - and we are massively underfitting
 
+hardware
+- runs are taking a long time atm and i realised i wasn't using mps - i read a while ago about gnns not being optimised for this, and running some tests it's about 12x slower than using the cpu. scatter.
+- also, i am doing this a dumb way. distance cutoff is applied to all edges, but we aren't interested in say protein-protein edges anyway, and there are loads of these. we could change the cut off so that interface edges cutoff is longer - say 6 angstroms - to try and capture more interactions. didn't want to do this earlier as it would take more time and memory, but if we have different cutoffs for different edge types then we can pick which ones we include. this also gives more interaction information and maybe better performance, especially if we can reduce the protein-protein cutoffd even more than 4 A.
+- implementing this: will start with 6A for interface, keep 4A for other. check that setting interface_ctoff = other_cutoff = 4A gives same result as old, which it does. changing one thing at a time, so 4A + 6A first, then go down to 3.5A to save more.
+
+it's worse on every single model:
+                   rmse 4/4  rmse 4/6    delta     r 4/4   r 4/6    delta
+gcn_plain             1.538     1.590   +0.052     0.328   0.199   -0.129
+gcn_contact_sum       1.516     1.532   +0.016     0.349   0.326   -0.023
+gcn_physics_blind     1.505     1.541   +0.036     0.380   0.330   -0.050
+gcn_physics           1.501     1.546   +0.045     0.390   0.301   -0.089
+
+mean rmse +0.0371, worse on 8/8      mean pearson -0.0728, worse on 8/8
+
+nope: adding extra at the interface is maybe just adding noise. can try 5/3 instead maybe
+
+running 3.5/5 - will need to adjust the reference distace (from 4A) if this is useful
+
+rmse, mean over seeds 0-1    3.5/5.0   4.0/4.0   4.0/6.0
+gcn_plain                      1.610     1.539     1.590
+gcn_contact_sum                1.532     1.516     1.532
+gcn_physics_blind              1.524     1.505     1.541
+gcn_physics                    1.536     1.508     1.546
+
+also worse on every model. interface radius increases whilst others stay the same. might be worth one last: 3.5/4 (saves on compute)
+
+3.5/4.0 minus 4.0/4.0, rmse        s0      s1      s2      s3      s4     mean     sd      t   verdict
+gcn_plain                       +0.020  +0.060  +0.051  -0.001  +0.038  +0.034  0.024  3.10     worse
+gcn_contact_sum                 +0.014  -0.005  -0.017  -0.006  +0.019  +0.001  0.015  0.17  no change
+gcn_physics_blind               +0.014  -0.000  +0.028  +0.044  +0.003  +0.018  0.018  2.17  no change
+gcn_physics                     +0.002  +0.023  +0.016  +0.035  +0.008  +0.017  0.013  2.96     worse
+                                                              (n=5, |t| > 2.776 at 95%)
+
+probs not worth it. keep it at 4/4
+
+we know that the physics branch isn't really physics, it's just another learned head. instead, can have a actual lennard jones potential and see how that affects things
+options:
+fix sigma (using vdw radii), learn eps
+learn eps and sigma
+fix both
+
+differs from current physics, which is unconstrained mlp on post conv h (i.e. depends on r, thousands of params). will be interesting to run all 3 to compare
+
+first running
+
+model                 s0     s1     s2     s3     s4    mean
+gcn_plain          1.536  1.541  1.757  1.731  1.495   1.612
+gcn_contact_sum    1.502  1.531  1.670  1.605  1.426   1.547
+gcn_physics_blind  1.477  1.533  1.658  1.556  1.429   1.531
+gcn_physics        1.507  1.509  1.664  1.564  1.423   1.533
+gcn_lj (fixed)     1.515  1.491  1.725  1.553  1.429   1.543
+
+         C      N      O      S      P      F     Cl     Br      I  other  metal
+mean  0.0111 0.0125 0.0103 0.0304 0.0094 0.0217 0.0175 0.0091 0.0159 0.0192 0.0213
+/C      1.00   1.12   0.93   2.74   0.85   1.96   1.58   0.82   1.43   1.73   1.92
+
+eps is initialised at 0.01 (note this is not in kcal/mol), and C, O, P don;t differ much from it. If the well is similar depth, then it'll be similar to a contact sum - i.e. performance is kind of close to the contact sum model. However, sulphur did change: sulphur is a larger, more polairsable atom than carbon so this looks like it's learning real chemistry. Fluorine should probs be below carbon given it will be small and hard, would expect general increase in the ratio as you go down the halogens but that hasn't happened here. Similarly, oxygen should be a larger eps than C, but that hasn't happened. C ended up close to the 0.01 init, will try again with a new init to see if it sticks close to that.
+
+just running seed 2, which for init 0.01 we got vals:
+     C      N      O      S      P      F     Cl     Br      I  other  metal
+0.0121 0.0136 0.0118 0.0290 0.0079 0.0287 0.0146 0.0083 0.0141 0.0175 0.0220   rmse 1.725
+
+type     init .01  init .03   ratio    travel from own init
+C          0.0121    0.0169    1.39     1.21x  vs  0.56x
+N          0.0136    0.0188    1.38     1.36x  vs  0.63x
+O          0.0118    0.0165    1.41     1.18x  vs  0.55x
+S          0.0290    0.0575    1.99     2.90x  vs  1.92x
+P          0.0079    0.0139    1.77     0.79x  vs  0.46x
+F          0.0287    0.0616    2.14     2.87x  vs  2.05x
+Cl         0.0146    0.0356    2.44     1.46x  vs  1.19x
+Br         0.0083    0.0228    2.73     0.83x  vs  0.76x
+I          0.0141    0.0544    3.85     1.41x  vs  1.81x
+other      0.0175    0.0346    1.98     1.75x  vs  1.15x
+metal      0.0220    0.0290    1.32     2.20x  vs  0.97x
+
+mean eps   0.0163    0.0329            rmse 1.725 vs 1.719
+
+so, well depths depend on starting point, but they do seem to retain the ordering we saw already. or, are we just not training for long enough for the optimised values of eps to be reached?
+trying ONLY the physics branch, i.e. prediction = energy + intercept.
+start at 4 different points, and let it run (very fast: only 12 params - the depths plus interecpt). grad <2e-8 so that gradient is getting really small, i.e. approaching the min. the vast majority of atoms are C, N, O, with the rest far fewer. Can try differentiating as C, N, O, other.
+
+
+FINE - converged on train, 4 inits          train mse  |grad|   val rmse
+  all four inits      0.895514   <=2e-08     1.847
+
+  C 0.0209  N 0.0042  O 0.0008  S 0.2949  P 0.0000  F 0.2074
+  Cl 0.1143  Br 0.0069  I 0.0482  other 0.0495  metal 0.4923
+  max/min across inits: 1.00x on 10 of 11 types (P 24x, but it converges to 0)
+
+COARSE - converged on train, 4 inits
+  all four inits      0.912729   <=3e-09     1.852
+  
+  C 0.0254  N 0.0011  O 0.0003  rest 0.1227
+  max/min across inits: 1.00x on all four      -> IDENTIFIED
+
+  val rmse is the rmse of pkd, so looks like it generalises woese than gcn_lj. max/min shows that on this one seed (seed 2), four different eps initialisations converge to the same epsilon for each atom type.
+
+  running across the other 4 seeds so 5 seeds total:
+
+  FINE     type    % weight  median eps  max/min across 5 seeds
+         C          76.49      0.0207      1.1    stable
+         O          50.14      0.0010      1.8
+         N          30.31      0.0045      1.4    stable
+         S           1.87      0.3079      1.2    stable
+         P           1.38      0.0000     65.1    (zero)
+         metal       1.28      0.5848      1.4    stable
+         F           0.93      0.1137      1.9
+         Cl          0.71      0.1143      1.1    stable
+         Br          0.12      0.0016     12.5    (near zero)
+         I           0.07      0.0547      1.3    stable
+         other       0.05      0.0432    376.7    erratic: 0.0007 to 0.2759
+
+COARSE   C          76.49      0.0240      1.1    stable
+         N          30.31      0.0023      2.7
+         O          50.14      0.0003      4.5    (near zero)
+         rest        6.13      0.1218      1.2    stable
+
+the caveat here is that each seed shares about 80% of complexes, so each split isn't really independent. still, it converges. the other metals don't, but lumping them together does. 
+interestingly, it is learning that oxygen and nitrogen have a much smaller well depth than carbon, which chemically isn;t the case. perhaps it's corresponding with non polar contacts being a better predictor of binding affinity.
+
+running over all seeds for "coarse" lj, i.e. dropping anything that isn't C, N, O:
+val rmse, seeds 2 and 3        s2     s3      vs coarse (2 seeds, directional only)
+gcn_plain                   1.757  1.731     -0.084   better 2/2
+gcn_contact_sum             1.670  1.605     +0.023   better 1/2
+gcn_physics_blind           1.658  1.556     +0.053   better 0/2
+gcn_physics                 1.664  1.564     +0.046   better 0/2
+gcn_lj (11 types)           1.725  1.553     +0.021   better 0/2
+gcn_lj_coarse (4 types)     1.755  1.565
+
+so, slightly worse than the 11-type lj. 
+- the branch's converged optimum is informative — carbon 10-20x deeper than nitrogen and oxygen, metal and sulfur deepest, stable across splits — but it generalises worse (val 1.85 against 1.73).
+- Training stops long before that point, (early stopping). The cost is that a trained checkpoint's eps carries no chemistry.
+- so can have either the chemistry or the predictions, not both from the same fit. Coarsening changes neither.
+
+seeing as it looks like non-polar contacts point to something, it's worth investigating that further.
+
+
 
 to do
 - run holdout test  Run a large-family holdout as a separate experiment: train on everything except the 532-cluster, test on that cluster alone.
